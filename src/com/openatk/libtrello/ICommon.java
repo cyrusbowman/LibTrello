@@ -1,4 +1,4 @@
-package edu.purdue.autogenics.libtrello;
+package com.openatk.libtrello;
 
 public interface ICommon {
 	public String getTrelloId();

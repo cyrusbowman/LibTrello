@@ -1,4 +1,4 @@
-package edu.purdue.autogenics.libtrello;
+package com.openatk.libtrello;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -14,15 +14,18 @@ import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.TimeZone;
 
 import org.apache.http.HttpResponse;
 import org.apache.http.client.ClientProtocolException;
 import org.apache.http.client.HttpClient;
 import org.apache.http.client.entity.UrlEncodedFormEntity;
+import org.apache.http.client.methods.HttpEntityEnclosingRequestBase;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.methods.HttpPut;
@@ -65,7 +68,11 @@ public class TrelloController {
 	
 	private Boolean syncAllBoards = false;
 	private Boolean autoSyncing = false;
-	
+	private Boolean reAddMembersToBoards = false;
+	List <String> membersAdded = new ArrayList<String>();; 
+	List <String> membersDeleted = new ArrayList<String>();; 
+
+
 	List <TrelloBoard> trelloBoards;
 	List <TrelloList> trelloLists;
 	List <TrelloCard> trelloCards; 
@@ -80,11 +87,15 @@ public class TrelloController {
 	private static final String COL_LAST_SYNC = "lastsync";
     public static final String COL_AUTO_SYNC = "auto_sync";
     public static final String COL_BOARD_NAME = "board_name";
-	private static final String AUTHORITY = "edu.purdue.autogenics.trello.provider";
+	private static final String AUTHORITY = "com.openatk.trello.provider";
 	private static final String BASE_PATH = "apps";
 	private static final String LOGINS_PATH = "logins";
+	private static final String MEMBERS_PATH = "organization_members";
+
 	private static final Uri CONTENT_URI = Uri.parse("content://" + AUTHORITY + "/" + BASE_PATH);
 	private static final Uri CONTENT_URI_LOGINS = Uri.parse("content://" + AUTHORITY + "/" + LOGINS_PATH);
+	public static final Uri CONTENT_URI_ORGANIZATION_MEMBERS = Uri.parse("content://" + AUTHORITY + "/" + MEMBERS_PATH);
+
 	
 	public TrelloController(Context AppContext) {
 		super();
@@ -109,6 +120,7 @@ public class TrelloController {
 	public void startAutoSync(){
 		if(autoSyncing == false){
 			if(autoSyncEnabled()){
+				autoSyncing = true;
 				beginAutoSync(AUTO_SYNC_INTERVAL);
 			}
 		}
@@ -131,6 +143,23 @@ public class TrelloController {
 		autoSyncing = false;
 		Log.d("TrelloController - stopAutoSync", "autoSync stopped");
 	}	
+	
+	public void syncDelayed(){
+		//5 second delayed sync that cancels previous, designed to be called on every change
+		final TrelloController parent = this;
+		Runnable sync_task = new Runnable(){
+		    @Override 
+		    public void run() {
+		    	parent.sync();
+		    }
+		};
+		autoSync_handler.removeCallbacksAndMessages(null);
+		if(autoSyncing){
+			Log.d("TrelloController - syncDelayed", "Waiting 5 seconds to sync");
+			autoSync_handler.postDelayed(sync_task, (5 * 1000));
+			autoSync_handler.postDelayed(autoSync_task, ((AUTO_SYNC_INTERVAL + 5) * 1000));
+		}
+	}
 
 	public boolean autoSyncEnabled(){
 		String[] projection = { COL_ID, COL_PACKAGE_NAME, COL_AUTO_SYNC };
@@ -243,6 +272,7 @@ public class TrelloController {
 					 editor.putString("TrelloKey", TrelloKey);
 					 editor.putString("TrelloToken", TrelloToken);
 					 editor.putString("OrganizationID", OrganizationID);
+					 editor.putString("dateLastSync", null); //Grab all data
 					 editor.commit();
 				}
 			}
@@ -254,19 +284,96 @@ public class TrelloController {
 		return found;
 	}
 	
+	private boolean getOrganizationMembers(){
+		Boolean membersChanged = false;
+	    String COL_MEMBER_ID = "member_id";
+	    String COL_ORGO_ID = "orgo_id";
+	    String where = COL_ORGO_ID + " = '" + OrganizationID + "'";
+	    	    
+		String[] projection = { COL_MEMBER_ID, COL_ORGO_ID };
+		try {
+			AppContext.getContentResolver().query(CONTENT_URI_ORGANIZATION_MEMBERS, projection, null, null, null);
+		} catch(Exception e){
+			//Old version v1 need to update trello
+			Log.d("Error", "Invaild URI Trello needs updated");
+			return false;
+		}
+		
+		Cursor mCursor = AppContext.getContentResolver().query(CONTENT_URI_ORGANIZATION_MEMBERS, projection, where, null, null);
+		if (null == mCursor) {
+			// If the Cursor is empty, the provider found no matches
+			Log.d("TrelloController - getOrganizationMembers", "Null cursor");
+		} else if (mCursor.getCount() < 1) {
+			Log.d("TrelloController - getOrganizationMembers", "None found");
+		} else {
+			//Results
+			List<String> memberIds = new ArrayList<String>();
+			
+			SharedPreferences settings = AppContext.getSharedPreferences(PREFS_NAME, 0);
+			Set<String> set = settings.getStringSet("organizationMembers", null);
+			if(set == null){
+				Log.d("TrelloController - getOrganizationMembers", "First Time");
+				set = new HashSet<String>();
+			}
+			
+			while(mCursor.moveToNext()){
+				String memberId = mCursor.getString(mCursor.getColumnIndex(COL_MEMBER_ID)).trim();
+				memberIds.add(memberId);
+				Log.d("TrelloController - getOrganizationMembers", "Cursor found id:" + memberId);
+				if(set.contains(memberId) == false){
+					//Member added
+					set.add(memberId);
+					membersAdded.add(memberId);
+					membersChanged = true;
+					Log.d("TrelloController - getOrganizationMembers", "Set doesnt have this");
+				}
+			}
+			mCursor.close();
+			
+			String[] setArray = (String[]) set.toArray(new String[set.size()]);
+			for(int i=0; i< setArray.length; i++){
+				if(memberIds.contains(setArray[i]) == false){
+					set.remove(setArray[i]);
+					membersDeleted.add(setArray[i]);
+					membersChanged = true;
+					Log.d("TrelloController - getOrganizationMembers", "A member was removed");
+				}
+			}
+		
+			if(membersChanged){
+				SharedPreferences.Editor editor = settings.edit();
+				editor.putStringSet("organizationMembers", set);
+				editor.commit();
+			}
+			
+			Log.d("TrelloController - getOrganizationMembers", "Organization Members Changed:" + Boolean.toString(membersChanged));
+		}
+		mCursor.close();
+
+		return membersChanged;
+	}
+	
 	public void sync(){
+		Log.d("TrelloController - sync", "Sync Called");
 		if(this.syncingEnabled()){
 			if(this.getAPIKeys()){
-				//Sync
-				if(currentlySyncing){
-					Log.d("TrelloController - sync", "Already syncing");
-				} else {
-					if(isNetworkConnected(AppContext)){
-						currentlySyncing = true;
-						new SyncTask(this, syncController).execute();
-					} else {
-						Log.d("TrelloController - sync", "No network connection");
+				if(isNetworkAvailable()){
+					if(this.getOrganizationMembers()){
+						reAddMembersToBoards = true;
 					}
+					//Sync
+					if(currentlySyncing){
+						Log.d("TrelloController - sync", "Already syncing");
+					} else {
+						if(isNetworkConnected(AppContext)){
+							currentlySyncing = true;
+							new SyncTask(this, syncController).execute();
+						} else {
+							Log.d("TrelloController - sync", "No network connection");
+						}
+					}
+				} else {
+					Log.d("TrelloController - sync", "No network connected");
 				}
 			} else {
 				Log.d("TrelloController - sync", "API Keys not loaded");
@@ -312,7 +419,7 @@ public class TrelloController {
 	    }
 	 }
 	
-	private void syncThread(ISyncController syncController){
+	private Boolean syncThread(ISyncController syncController){
 		//Check if syncing is enabled
 		
 		trelloLists = new ArrayList<TrelloList>();
@@ -322,8 +429,34 @@ public class TrelloController {
 		List<IList> localLists;
 		List<IBoard> localBoards;
 		Boolean addedBoards = false;
+		Boolean internetFailed = false;
 		
 		localBoards = syncController.getLocalBoards();
+		if(reAddMembersToBoards){
+			if(localBoards.isEmpty() == false){
+				for(int i=0; i < localBoards.size(); i++){
+					if(localBoards.get(i).getTrelloId().length() != 0){
+						//Add and remove all members to this board
+						Iterator<String> iterator = membersAdded.iterator();
+						while (iterator.hasNext()) {
+							String member = iterator.next();
+							if(addMemberToBoard(member, localBoards.get(i).getTrelloId()) == true){
+								iterator.remove();
+							}
+						}
+						iterator = membersDeleted.iterator();
+						while (iterator.hasNext()) {
+							String member = iterator.next();
+							if(removeMemberFromBoard(member, localBoards.get(i).getTrelloId()) == true){
+								iterator.remove();
+							}
+						}
+					}
+				}
+			}
+			reAddMembersToBoards = false;
+		}
+		
 		//TODO only do if changes
 		if(localBoards.isEmpty() == false){
 			if(localBoards.get(0).getTrelloId().length() != 0){
@@ -342,58 +475,63 @@ public class TrelloController {
 			Log.d("SyncingAll Boards", "SyncingAll Boards");
 			//Download all boards from Trello
 			trelloBoards = getBoards();
-			
-			//Loop through boards and update accordingly
-			for(int i=0; i < trelloBoards.size(); i++){
-				TrelloBoard board = trelloBoards.get(i);
-				
-				//Find in LocalBoards
-				IBoard localBoard = null;
-				for(int j=0; j < localBoards.size(); j++){
-					if(board.getTrelloId().contentEquals(localBoards.get(j).getTrelloId())){
-						localBoard = localBoards.get(j);
+			if(trelloBoards == null){
+				internetFailed = true;
+			} else {
+				//Loop through boards and update accordingly
+				for(int i=0; i < trelloBoards.size(); i++){
+					TrelloBoard board = trelloBoards.get(i);
+					
+					//Find in LocalBoards
+					IBoard localBoard = null;
+					for(int j=0; j < localBoards.size(); j++){
+						if(board.getTrelloId().contentEquals(localBoards.get(j).getTrelloId())){
+							localBoard = localBoards.get(j);
+						}
 					}
-				}
-				if(localBoard != null){
-					if(localBoard.hasLocalChanges()){
-						//Overwrite trello
-						syncController.setBoardLocalChanges(localBoard, false);
-						Boolean result = UpdateBoardOnTrello(localBoard);
-						if(result == false){
-							//If failed to overwrite
-							syncController.setBoardLocalChanges(localBoard, true);
+					if(localBoard != null){
+						if(localBoard.hasLocalChanges()){
+							//Overwrite trello
+							syncController.setBoardLocalChanges(localBoard, false);
+							Boolean result = UpdateBoardOnTrello(localBoard);
+							if(result == false){
+								//If failed to overwrite
+								syncController.setBoardLocalChanges(localBoard, true);
+							}
+						} else {
+							//No changes on local
+							//Try to convert and check and overwrite local if different
+							syncController.updateBoard(localBoard, board);
 						}
 					} else {
-						//No changes on local
-						//Try to convert and check and overwrite local if different
-						syncController.updateBoard(localBoard, board);
-					}
-				} else {
-					//New board on trello
-					//Try to convert add to local if converts success
-					syncController.addBoard(board);
-				}
-			}
-			//Get again, some of trello's may have replaced our local copies without id's
-			localBoards = syncController.getLocalBoards();
-			//Add boards from local to trello that aren't on trello yet
-			for(int j=0; j < localBoards.size(); j++){
-				IBoard localBoard = localBoards.get(j);
-				if(localBoard.getTrelloId().length() == 0){
-					//Add board to trello
-					addedBoards = true;
-					String newId = AddBoardToTrello(localBoard);
-					syncController.setBoardLocalChanges(localBoard, false);
-					if(newId != null){
-						Log.d("TrelloController - sync", "Updating board id");
-						syncController.setBoardTrelloId(localBoard, newId);
-					} else {
-						syncController.setBoardLocalChanges(localBoard, true);
+						//New board on trello
+						//Try to convert add to local if converts success
+						syncController.addBoard(board);
 					}
 				}
+				//Get again, some of trello's may have replaced our local copies without id's
+				localBoards = syncController.getLocalBoards();
+				//Add boards from local to trello that aren't on trello yet
+				for(int j=0; j < localBoards.size(); j++){
+					IBoard localBoard = localBoards.get(j);
+					if(localBoard.getTrelloId().length() == 0){
+						//Add board to trello
+						addedBoards = true;
+						String newId = AddBoardToTrello(localBoard);
+						syncController.setBoardLocalChanges(localBoard, false);
+						if(newId != null){
+							Log.d("TrelloController - sync", "Updating board id");
+							syncController.setBoardTrelloId(localBoard, newId);
+						} else {
+							syncController.setBoardLocalChanges(localBoard, true);
+						}
+					}
+				}
+				syncAllBoards = false;
 			}
-			syncAllBoards = false;
 		}
+		
+		if(internetFailed == true) return false;
 		
 		if(addedBoards){
 			//Get again, trello id changed
@@ -405,6 +543,8 @@ public class TrelloController {
 			if(localBoard.getTrelloId().length() != 0){
 				//Sync Cards and Lists of all localBoards with trelloIds
 				TrelloBoard trelloBoard = getListsAndCards(localBoard.getTrelloId());
+				
+				if(trelloBoard == null) return false; //Internet failed
 				
 				//*** BOARD SYNC ***
 				//Find in LocalBoards
@@ -516,9 +656,10 @@ public class TrelloController {
 									// Local was edited last or at same second, update trello to local
 									if(localCard.getListId().length() != 0){
 										//Overwrite trello
-										syncController.setCardLocalChanges(localCard, false);
 										Boolean result = UpdateCardOnTrello(localCard);
-										if(result == false){
+										if(result){
+											syncController.setCardLocalChanges(localCard, false);
+										} else {
 											//If failed to overwrite
 											Log.d("TrelloController - sync", "Failed to update card on trello");
 											syncController.setCardLocalChanges(localCard, true);
@@ -577,8 +718,79 @@ public class TrelloController {
 				}
 			}
 		}
+		return internetFailed;
 	}
 	
+	private Boolean addMemberToBoard(String memberId, String boardId){
+		Boolean success = true;
+		HttpClient client = new DefaultHttpClient();
+		List<BasicNameValuePair> results = new ArrayList<BasicNameValuePair>();
+		results.add(new BasicNameValuePair("key",TrelloKey));
+		results.add(new BasicNameValuePair("token",TrelloToken));
+		//Add to board
+		HttpPut put = new HttpPut("https://api.trello.com/1/boards/" + boardId + "/members/" + memberId);
+		results.add(new BasicNameValuePair("type","normal"));
+		try {
+			String result = "";
+			try {
+				put.setEntity(new UrlEncodedFormEntity(results));
+				HttpResponse response = client.execute(put);
+				if(response != null){
+					InputStream is = response.getEntity().getContent(); 
+					result = convertStreamToString(is);
+				} else {
+					Log.d("TrelloController - addMemberToBoard", "No internet data");
+					success = false;
+				}
+			} catch (IllegalStateException e) {
+				e.printStackTrace();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+			Log.d("TrelloController - addMemberToBoard", "Add Response:" + result);
+		} catch (Exception e) {
+			Log.e("TrelloController - addMemberToBoard","client protocol exception", e);
+			success = false;
+		}
+		return success;
+	}
+	private Boolean removeMemberFromBoard(String memberId, String boardId){
+		Boolean success = true;
+		HttpClient client = new DefaultHttpClient();
+		HttpDeleteWithBody delete;
+		
+		List<BasicNameValuePair> results = new ArrayList<BasicNameValuePair>();
+		results.add(new BasicNameValuePair("key",TrelloKey));
+		results.add(new BasicNameValuePair("token",TrelloToken));
+		delete = new HttpDeleteWithBody("https://api.trello.com/1/boards/" + boardId + "/members/" + memberId);
+		try {
+			String result = "";
+			try {
+				delete.setEntity(new UrlEncodedFormEntity(results));
+				HttpResponse response = client.execute(delete);
+				if(response != null){
+					InputStream is = response.getEntity().getContent(); 
+					result = convertStreamToString(is);
+				} else {
+					Log.d("TrelloController - removeMemberFromBoard", "No internet data");
+					success = false;
+				}
+			} catch (IllegalStateException e) {
+				e.printStackTrace();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+			Log.d("TrelloController - removeMemberFromBoard", "Remove Response:" + result);
+			if(result.contains("Not enough admins")){
+				Log.d("TrelloController - removeMemberFromBoard", "Failed to remove");
+				success = false;
+			}
+		} catch (Exception e) {
+			Log.e("TrelloController - removeMemberFromBoard","client protocol exception", e);
+			success = false;
+		}
+		return success;
+	}
 	private Boolean UpdateCardOnTrello(ICard theCard){
 		Log.d("TrelloController - UpdateCardOnTrello", "Called");
 		HttpClient client = new DefaultHttpClient();
@@ -828,7 +1040,8 @@ public class TrelloController {
 		
 		if(theBoard.getName() != null) results.add(new BasicNameValuePair("name", theBoard.getName()));
 		if(theBoard.getDesc() != null) results.add(new BasicNameValuePair("desc", theBoard.getDesc()));
-		
+		results.add(new BasicNameValuePair("prefs_permissionLevel", "org"));
+
 		String newId = null;
 		try {
 			post.setEntity(new UrlEncodedFormEntity(results));
@@ -862,6 +1075,18 @@ public class TrelloController {
 		} catch (IOException e) {
 			Log.e("AddBoardToTrello", "io exception", e);
 		}
+		
+		if(newId != null){
+			//Add all members to this board
+			SharedPreferences settings = AppContext.getSharedPreferences(PREFS_NAME, 0);
+			Set<String> set = settings.getStringSet("organizationMembers", null);
+			if(set != null){
+				String[] setArray = (String[]) set.toArray(new String[set.size()]);
+				for(int i=0; i< setArray.length; i++){
+					addMemberToBoard(setArray[i], newId);
+				}
+			}
+		}
 		return newId; //TODO return null on failure
 	}
 	
@@ -871,49 +1096,54 @@ public class TrelloController {
 		String url = "https://api.trello.com/1/organizations/" + OrganizationID + "/boards?key=" + TrelloKey + "&token=" + TrelloToken + "&filter=open&fields=name,desc";
 		
 		HttpResponse response = getData(url);
-		String result = "";
-		try {
-			//Error here if no Internet
-			InputStream is = response.getEntity().getContent(); 
-			result = convertStreamToString(is);
-		} catch (IllegalStateException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		} catch (IOException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
-		//Log.d("getBoards", "Result:" + result);
-		JSONArray json = null;
-		try {
-			json = new JSONArray(result);
-		} catch (JSONException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
-				
-		// Loop through boards from trello
-		for (int i = 0; i < json.length(); i++) {
-			
-			JSONObject jsonBoard = null;
-			
-			String trello_id = "";
-			String name = "";
-			String desc = "";
-			
+		if(response != null){
+			String result = "";
 			try {
-				jsonBoard = json.getJSONObject(i);
-				trello_id = jsonBoard.getString("id");
-				name = jsonBoard.getString("name");
-				desc = jsonBoard.getString("desc");
-			} catch (JSONException e) {
+				//Error here if no Internet
+				InputStream is = response.getEntity().getContent(); 
+				result = convertStreamToString(is);
+			} catch (IllegalStateException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			} catch (IOException e) {
+				// TODO Auto-generated catch block
 				e.printStackTrace();
 			}
-			
-			TrelloBoard newBoard = new TrelloBoard(trello_id, name, desc, false);
-			boardsList.add(newBoard);
+			//Log.d("getBoards", "Result:" + result);
+			JSONArray json = null;
+			try {
+				json = new JSONArray(result);
+			} catch (JSONException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+					
+			// Loop through boards from trello
+			for (int i = 0; i < json.length(); i++) {
+				
+				JSONObject jsonBoard = null;
+				
+				String trello_id = "";
+				String name = "";
+				String desc = "";
+				
+				try {
+					jsonBoard = json.getJSONObject(i);
+					trello_id = jsonBoard.getString("id");
+					name = jsonBoard.getString("name");
+					desc = jsonBoard.getString("desc");
+				} catch (JSONException e) {
+					e.printStackTrace();
+				}
+				
+				TrelloBoard newBoard = new TrelloBoard(trello_id, name, desc, false);
+				boardsList.add(newBoard);
+			}
+			return boardsList;
+		} else {
+			Log.d("TrelloController - getBoards", "No internet data");
+			return null;
 		}
-		return boardsList;
 	}
 
 	class TrelloAction {
@@ -974,6 +1204,7 @@ public class TrelloController {
 		reportSyncTime(dateFormaterReport.format(new Date()));
 		
 		HttpResponse response = getData(url);
+		if(response == null) return null;
 		String result = "";
 		try {
 			//Error here if no Internet
@@ -991,7 +1222,6 @@ public class TrelloController {
 		String board_desc = "";
 		Boolean closed = false;
 		
-				
 		JSONArray actions = null;
 		JSONArray lists = null;
 		try {
@@ -1005,7 +1235,6 @@ public class TrelloController {
 		} catch (JSONException e) {
 			e.printStackTrace();
 		}
-				
 		
 		List <TrelloAction> trelloActions = new ArrayList<TrelloAction>(); 
 		// Loop through actions from trello
@@ -1222,5 +1451,25 @@ public class TrelloController {
 			e.printStackTrace();
 		}
 		return response;
+	}
+	class HttpDeleteWithBody extends HttpEntityEnclosingRequestBase {
+	    public static final String METHOD_NAME = "DELETE";
+	    public String getMethod() { return METHOD_NAME; }
+
+	    public HttpDeleteWithBody(final String uri) {
+	        super();
+	        setURI(URI.create(uri));
+	    }
+	    public HttpDeleteWithBody(final URI uri) {
+	        super();
+	        setURI(uri);
+	    }
+	    public HttpDeleteWithBody() { super(); }
+	}
+	private boolean isNetworkAvailable() {
+	    ConnectivityManager connectivityManager 
+	          = (ConnectivityManager) this.AppContext.getSystemService(Context.CONNECTIVITY_SERVICE);
+	    NetworkInfo activeNetworkInfo = connectivityManager.getActiveNetworkInfo();
+	    return activeNetworkInfo != null && activeNetworkInfo.isConnected();
 	}
 }

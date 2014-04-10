@@ -1,4 +1,4 @@
-package edu.purdue.autogenics.libtrello;
+package com.openatk.libtrello;
 
 import java.util.Date;
 import java.util.List;
